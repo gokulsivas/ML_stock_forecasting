@@ -1,3 +1,4 @@
+import os                          # ← ADDED
 import torch
 import sys
 sys.path.append('..')
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import joblib
+
 
 # NIFTY 50 first, then fill remaining slots from DB
 PRIORITY_SYMBOLS = [
@@ -83,7 +85,7 @@ def create_return_sequences(df, sequence_length=90):
 
 def train_large_model():
     config = {
-        'batch_size': 128,        # larger batch = faster on GPU
+        'batch_size': 128,
         'sequence_length': 90,
         'hidden_size': 256,
         'num_layers': 3,
@@ -103,11 +105,9 @@ def train_large_model():
 
     loader = StockDataLoader()
 
-    # Get all available symbols with enough history
     all_symbols = loader.get_stocks_with_min_history(min_days=1500)
     print(f"\nTotal symbols with 1500+ days history: {len(all_symbols)}")
 
-    # Priority: NIFTY 50 first, then fill up to TARGET_STOCKS
     priority = [s for s in PRIORITY_SYMBOLS if s in all_symbols]
     others   = [s for s in all_symbols if s not in priority]
     selected = priority + others[:max(0, TARGET_STOCKS - len(priority))]
@@ -115,7 +115,7 @@ def train_large_model():
     print(f"NIFTY 50 (priority): {len(priority)}")
     print(f"Other stocks:        {len(selected) - len(priority)}")
     print(f"Total selected:      {len(selected)}")
-    print("="*60)
+    print("=" * 60)
 
     all_Xtrain, all_ytrain = [], []
     all_Xval,   all_yval   = [], []
@@ -151,7 +151,7 @@ def train_large_model():
             print(f"ERROR: {e}")
             failed.append(symbol)
 
-    print("="*60)
+    print("=" * 60)
     print(f"Successfully processed: {len(successful)} stocks")
     print(f"Failed/skipped:         {len(failed)} stocks")
 
@@ -167,7 +167,10 @@ def train_large_model():
     print(f"Total training samples: {len(Xtrain):,}")
     print(f"Total val samples:      {len(Xval):,}")
     print(f"Input features:         {Xtrain.shape[2]}")
-    print("="*60)
+    print("=" * 60)
+
+    # ← ADDED: create folder before saving
+    os.makedirs('saved_models', exist_ok=True)
 
     # Save metadata
     joblib.dump(feature_cols, 'saved_models/returns_feature_cols.pkl')
@@ -175,10 +178,10 @@ def train_large_model():
 
     train_dataset = StockSequenceDataset(Xtrain, ytrain)
     val_dataset   = StockSequenceDataset(Xval,   yval)
-    train_loader  = DataLoader(train_dataset, batch_size=config['batch_size'],
-                               shuffle=True, num_workers=4, pin_memory=True)
-    val_loader    = DataLoader(val_dataset,   batch_size=config['batch_size'],
-                               num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'],
+                              num_workers=0, pin_memory=False)
 
     input_size = Xtrain.shape[2]
     model = HybridLSTMGRU(
@@ -193,10 +196,10 @@ def train_large_model():
     trainer.train(train_loader, val_loader, config['epochs'],
                   save_path='saved_models/returns_model.pth')
 
-    print("="*60)
+    print("=" * 60)
     print(f"DONE! Model saved: saved_models/returns_model.pth")
     print(f"Trained on {len(successful)} stocks")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

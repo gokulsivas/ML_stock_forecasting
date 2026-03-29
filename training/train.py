@@ -1,11 +1,13 @@
+import os
+import sys
 import torch
 import torch.nn as nn
-import torch.nn.functional as F          # ← MISSING, added here
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import numpy as np
 from tqdm import tqdm
-import sys
+
 sys.path.append('..')
 
 from data.data_loader import StockDataLoader
@@ -22,12 +24,9 @@ class DirectionalLoss(nn.Module):
 
     def forward(self, predictions, targets):
         mse_loss = F.mse_loss(predictions, targets)
-
-        # Penalize wrong direction predictions
         pred_dir = torch.sign(predictions)
         true_dir = torch.sign(targets)
         dir_loss = torch.mean((pred_dir != true_dir).float())
-
         return self.mse_weight * mse_loss + self.dir_weight * dir_loss
 
 
@@ -39,25 +38,85 @@ class StockTrainer:
         self.device = device
         self.config = config
 
-        # Mixed precision training (ESSENTIAL for 6GB VRAM)
-        self.scaler = GradScaler()
-
+        self.scaler = GradScaler('cuda')
         self.criterion = DirectionalLoss(mse_weight=0.6, dir_weight=0.4)
         self.optimizer = torch.optim.Adam(
-            model.parameters(),
+            self.model.parameters(),
             lr=config['learning_rate']
         )
-
-        # Learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=8, verbose=True
+            self.optimizer, mode='min', factor=0.5, patience=8
         )
 
         self.best_val_loss = float('inf')
         self.patience_counter = 0
+        self.start_epoch = 1
+
+    # ── checkpoint helpers ────────────────────────────────────────────────
+
+    def _checkpoint_dict(self, epoch):
+        return {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'patience_counter': self.patience_counter,
+            'config': self.config,
+        }
+
+    def save_best_checkpoint(self, epoch, save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(self._checkpoint_dict(epoch), save_path)
+
+    def save_latest_checkpoint(self, epoch, save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(self._checkpoint_dict(epoch), save_path)
+
+    def _same_shape(self, state_a, state_b):
+        if state_a.keys() != state_b.keys():
+            return False
+        for k in state_a:
+            if state_a[k].shape != state_b[k].shape:
+                return False
+        return True
+
+    def load_checkpoint(self, latest_path):
+        if not os.path.exists(latest_path):
+            print("No checkpoint found. Starting from epoch 1.")
+            return
+
+        checkpoint = torch.load(latest_path, map_location=self.device)
+        ckpt_model_state = checkpoint.get('model_state_dict', None)
+
+        if ckpt_model_state is None or not self._same_shape(self.model.state_dict(), ckpt_model_state):
+            print("Checkpoint found but model shape does not match. Starting from epoch 1.")
+            return
+
+        self.model.load_state_dict(ckpt_model_state)
+
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception:
+                print("Warning: optimizer state could not be loaded. Continuing without it.")
+
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception:
+                print("Warning: scheduler state could not be loaded. Continuing without it.")
+
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.patience_counter = checkpoint.get('patience_counter', 0)
+        self.start_epoch = checkpoint.get('epoch', 0) + 1
+
+        print(f"Resuming from epoch {self.start_epoch}")
+        print(f"Best val loss so far: {self.best_val_loss:.6f}")
+
+    # ── training loop ─────────────────────────────────────────────────────
 
     def train_epoch(self, train_loader):
-        """Train one epoch with mixed precision"""
         self.model.train()
         total_loss = 0
 
@@ -67,7 +126,7 @@ class StockTrainer:
 
             self.optimizer.zero_grad()
 
-            with autocast():
+            with autocast('cuda'):
                 outputs = self.model(X_batch)
                 loss = self.criterion(outputs, y_batch)
 
@@ -80,7 +139,6 @@ class StockTrainer:
         return total_loss / len(train_loader)
 
     def validate(self, val_loader):
-        """Validation with mixed precision"""
         self.model.eval()
         total_loss = 0
 
@@ -89,7 +147,7 @@ class StockTrainer:
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
-                with autocast():
+                with autocast('cuda'):
                     outputs = self.model(X_batch)
                     loss = self.criterion(outputs, y_batch)
 
@@ -97,38 +155,48 @@ class StockTrainer:
 
         return total_loss / len(val_loader)
 
-    def train(self, train_loader, val_loader, epochs, save_path='saved_models/best_model.pth'):
-        """Full training loop with early stopping"""
+    def train(
+        self,
+        train_loader,
+        val_loader,
+        epochs,
+        best_save_path='saved_models/best_model.pth',
+        latest_save_path='saved_models/latest_checkpoint.pth'
+    ):
+        self.load_checkpoint(latest_save_path)
 
-        for epoch in range(epochs):
+        for epoch in range(self.start_epoch, epochs + 1):
             train_loss = self.train_epoch(train_loader)
             val_loss = self.validate(val_loader)
 
             self.scheduler.step(val_loss)
 
-            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"Epoch {epoch}/{epochs}")
             print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
             if torch.cuda.is_available():
                 print(f"GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 
+            # Always save latest so we can resume from here
+            self.save_latest_checkpoint(epoch, latest_save_path)
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
-                torch.save(self.model.state_dict(), save_path)
+                self.save_best_checkpoint(epoch, best_save_path)
                 print(f"Model saved! Best val loss: {val_loss:.6f}")
             else:
                 self.patience_counter += 1
+                print(f"No improvement ({self.patience_counter}/{self.config['early_stopping_patience']})")
 
             if self.patience_counter >= self.config['early_stopping_patience']:
-                print(f"Early stopping triggered after {epoch+1} epochs")
+                print(f"Early stopping triggered after {epoch} epochs")
                 break
 
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def main():
-    """Quick single-stock test — main training is in train_nifty250.py"""
-
     config = {
         'batch_size': 128,
         'sequence_length': 90,
@@ -153,30 +221,33 @@ def main():
     print(f"Training on: {test_symbol}")
 
     df = loader.load_stock_data(test_symbol)
-    print(f"Loaded {len(df)} days of data")
-
     preprocessor = TimeSeriesPreprocessor(sequence_length=config['sequence_length'])
     preprocessor.fit_scalers(df)
     X, y = preprocessor.transform(df)
     X_seq, y_seq = preprocessor.create_sequences(X, y)
 
-    print(f"Sequences shape: {X_seq.shape}, {y_seq.shape}")
-
     train_size = int(len(X_seq) * config['train_split'])
-    val_size   = int(len(X_seq) * config['val_split'])
+    val_size = int(len(X_seq) * config['val_split'])
 
-    X_train = X_seq[:train_size]
-    y_train = y_seq[:train_size]
-    X_val   = X_seq[train_size:train_size+val_size]
-    y_val   = y_seq[train_size:train_size+val_size]
+    train_dataset = StockSequenceDataset(X_seq[:train_size], y_seq[:train_size])
+    val_dataset = StockSequenceDataset(
+        X_seq[train_size:train_size + val_size],
+        y_seq[train_size:train_size + val_size]
+    )
 
-    train_dataset = StockSequenceDataset(X_train, y_train)
-    val_dataset   = StockSequenceDataset(X_val, y_val)
-
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
-                              shuffle=True, num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_dataset, batch_size=config['batch_size'],
-                              num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        num_workers=4,
+        pin_memory=True
+    )
 
     input_size = X_seq.shape[2]
     model = HybridLSTMGRU(
@@ -189,7 +260,6 @@ def main():
 
     trainer = StockTrainer(model, device, config)
     trainer.train(train_loader, val_loader, config['epochs'])
-
     preprocessor.save_scalers()
     print("Training completed!")
 
