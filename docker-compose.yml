@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  ml-trainer:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DB_HOST=localhost
+      - DB_PORT=5432
+      - DB_NAME=stockdb
+      - DB_USER=stockuser
+      - DB_PASSWORD=stockpass
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - NOTIFY_EMAIL=${NOTIFY_EMAIL}
+    volumes:
+      - ./saved_models:/app/saved_models
+      - ./training_logs:/app/training_logs
+      - pg_data:/var/lib/postgresql/data
+    shm_size: '4gb'
+
+volumes:
+  pg_data:
