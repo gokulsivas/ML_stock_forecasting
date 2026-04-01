@@ -3,12 +3,14 @@ import sys
 import os
 import time
 import traceback
-import requests
 from datetime import datetime
+import resend
 
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 NOTIFY_EMAIL   = os.environ.get('NOTIFY_EMAIL', '')
 LOG_FILE       = 'training_logs/training_log.txt'
+
+resend.api_key = RESEND_API_KEY
 
 
 def log(msg):
@@ -22,43 +24,31 @@ def log(msg):
 
 def send_email(subject, body_html):
     if not RESEND_API_KEY or not NOTIFY_EMAIL:
-        log("WARNING: Resend API key or email not set. Skipping email.")
+        log("⚠ Resend API key or email not set. Skipping email.")
         return
     try:
-        # ✅ FIXED: direct HTTP call to Resend API — no package needed
-        response = requests.post(
-            'https://api.resend.com/emails',
-            headers={
-                'Authorization': f'Bearer {RESEND_API_KEY}',
-                'Content-Type':  'application/json'
-            },
-            json={
-                'from':    'Stock Trainer <onboarding@resend.dev>',
-                'to':      [NOTIFY_EMAIL],
-                'subject': subject,
-                'html':    body_html
-            },
-            timeout=15
-        )
-        if response.status_code in (200, 201):
-            log(f"Email sent to {NOTIFY_EMAIL}")
-        else:
-            log(f"Email failed: {response.status_code} — {response.text}")
+        resend.Emails.send({
+            "from":    "Stock Trainer <onboarding@resend.dev>",
+            "to":      [NOTIFY_EMAIL],
+            "subject": subject,
+            "html":    body_html
+        })
+        log(f"✅ Email sent to {NOTIFY_EMAIL}")
     except Exception as e:
-        log(f"Failed to send email: {e}")
+        log(f"❌ Failed to send email: {e}")
 
 
 def start_postgres():
     log("Starting PostgreSQL...")
     subprocess.run(['service', 'postgresql', 'start'], check=True)
     time.sleep(3)
-    log("PostgreSQL started")
+    log("✅ PostgreSQL started")
 
 
 def restore_database():
     dump_path = 'stock_backup.dump'
     if not os.path.exists(dump_path):
-        log("No dump file found at stock_backup.dump — skipping restore.")
+        log("⚠ No dump file found at stock_backup.dump — skipping restore.")
         return
 
     log("Restoring database from dump...")
@@ -72,9 +62,9 @@ def restore_database():
        env={**os.environ, 'PGPASSWORD': 'stockpass'})
 
     if result.returncode == 0:
-        log("Database restored successfully")
+        log("✅ Database restored successfully")
     else:
-        log(f"pg_restore warnings (may be harmless):\n{result.stderr[-500:]}")
+        log(f"⚠ pg_restore warnings (may be harmless):\n{result.stderr[-500:]}")
 
 
 def run_training():
@@ -116,15 +106,15 @@ def read_last_log_lines(n=30):
 
 
 def main():
-    log("Orchestrator started")
+    log("🚀 Orchestrator started")
 
     # Step 1 — Start PostgreSQL
     try:
         start_postgres()
     except Exception as e:
-        log(f"PostgreSQL failed to start: {e}")
+        log(f"❌ PostgreSQL failed to start: {e}")
         send_email(
-            "Training Failed - PostgreSQL Error",
+            "❌ Training Failed — PostgreSQL Error",
             f"<h2>PostgreSQL failed to start</h2><pre>{traceback.format_exc()}</pre>"
         )
         sys.exit(1)
@@ -133,15 +123,15 @@ def main():
     try:
         restore_database()
     except Exception as e:
-        log(f"DB restore error (continuing anyway): {e}")
+        log(f"⚠ DB restore error (continuing anyway): {e}")
 
     # Step 3 — Run training
     try:
         return_code, hours, minutes = run_training()
     except Exception as e:
-        log(f"Training crashed: {e}")
+        log(f"❌ Training crashed: {e}")
         send_email(
-            "Training Crashed",
+            "❌ Training Crashed",
             f"<h2>Training crashed with exception</h2><pre>{traceback.format_exc()}</pre>"
         )
         sys.exit(1)
@@ -150,11 +140,11 @@ def main():
     last_logs = read_last_log_lines(30)
 
     if return_code == 0:
-        log(f"Training completed in {hours}h {minutes}m")
+        log(f"✅ Training completed in {hours}h {minutes}m")
         send_email(
-            f"Training Complete - {hours}h {minutes}m",
+            f"✅ Training Complete — {hours}h {minutes}m",
             f"""
-            <h2>Stock Model Training Complete!</h2>
+            <h2>✅ Stock Model Training Complete!</h2>
             <p><b>Duration:</b> {hours} hours {minutes} minutes</p>
             <p><b>Model saved to:</b> saved_models/returns_model.pth</p>
             <hr>
@@ -166,11 +156,11 @@ def main():
             """
         )
     else:
-        log(f"Training failed with return code {return_code}")
+        log(f"❌ Training failed with return code {return_code}")
         send_email(
-            f"Training Failed - Exit Code {return_code}",
+            f"❌ Training Failed — Exit Code {return_code}",
             f"""
-            <h2>Training Failed</h2>
+            <h2>❌ Training Failed</h2>
             <p><b>Exit code:</b> {return_code}</p>
             <hr>
             <h3>Last 30 log lines:</h3>
