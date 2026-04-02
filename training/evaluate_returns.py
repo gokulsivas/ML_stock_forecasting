@@ -32,11 +32,16 @@ def evaluate_returns_model(test_symbol):
     
     # Normalize features
     scaler = StandardScaler()
+    for lag in [1, 2, 3, 5, 10]:
+        df[f'return_lag_{lag}'] = df['close_price'].pct_change().shift(lag)
+    df['volume_spike'] = df['volume'] / (df['volume'].rolling(20).mean() + 1e-9)
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna()
     X = scaler.fit_transform(df[feature_cols].values)
     y = df['target_return'].values.reshape(-1, 1)
     
     # Create sequences
-    sequence_length = 60
+    sequence_length = 90
     X_seq, y_seq = [], []
     for i in range(len(X) - sequence_length):
         X_seq.append(X[i:i + sequence_length])
